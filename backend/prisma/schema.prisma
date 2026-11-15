@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum AccountStatus {
+  PENDING_EMAIL_VERIFICATION
+  PENDING_ADMIN_ACTIVATION
+  PROVISIONING_OPENNEBULA_IDENTITY
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+enum ProvisioningMode {
+  PRESET
+  CUSTOM
+}
+
+enum OperationStatus {
+  PENDING
+  SUBMITTING
+  PROVISIONING
+  READY
+  FAILED
+}
+
+model User {
+  id                 String        @id @default(uuid())
+  username           String        @unique
+  email              String        @unique
+  passwordHash       String        @map("password_hash")
+  role               UserRole      @default(USER)
+  accountStatus      AccountStatus @default(PENDING_EMAIL_VERIFICATION) @map("account_status")
+  emailVerifiedAt    DateTime?     @map("email_verified_at")
+  opennebulaUserId   Int?          @unique @map("opennebula_user_id")
+  opennebulaUsername String?       @unique @map("opennebula_username")
+  rejectionReason    String?       @map("rejection_reason")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+  activatedAt        DateTime?     @map("activated_at")
+
+  verificationCodes  EmailVerificationCode[]
+  operations         ProvisioningOperation[]
+  virtualMachines    VirtualMachine[]
+  auditEvents        AuditEvent[]
+
+  @@map("users")
+}
+
+model EmailVerificationCode {
+  id           String    @id @default(uuid())
+  userId       String    @map("user_id")
+  codeHash     String    @map("code_hash")
+  expiresAt    DateTime  @map("expires_at")
+  attemptCount Int       @default(0) @map("attempt_count")
+  sentAt       DateTime  @default(now()) @map("sent_at")
+  consumedAt   DateTime? @map("consumed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("email_verification_codes")
+}
+
+model OperatingSystem {
+  id                String   @id @default(uuid())
+  slug              String   @unique
+  name              String
+  description       String
+  defaultSshUser    String   @default("root") @map("default_ssh_user")
+  icon              String   @default("linux")
+  opennebulaImageId Int      @map("opennebula_image_id")
+  baseTemplateId    Int      @map("base_template_id")
+  baseDiskMb        Int      @default(512) @map("base_disk_mb")
+  active            Boolean  @default(true)
+  displayOrder      Int      @default(0) @map("display_order")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  templateMappings  OfferingTemplateMapping[]
+  customPolicies    CustomProvisioningPolicy[]
+  operations        ProvisioningOperation[]
+  virtualMachines   VirtualMachine[]
+
+  @@map("operating_systems")
+}
+
+model VmOffering {
+  id           String   @id @default(uuid())
+  slug         String   @unique
+  name         String
+  description  String
+  workloadTag  String   @default("General Purpose") @map("workload_tag")
+  vcpu         Int
+  cpuCapacity  Float    @map("cpu_capacity")
+  memoryMb     Int      @map("memory_mb")
+  rootDiskGb   Int      @map("root_disk_gb")
+  active       Boolean  @default(true)
+  displayOrder Int      @default(0) @map("display_order")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  templateMappings OfferingTemplateMapping[]
+  operations       ProvisioningOperation[]
+  virtualMachines  VirtualMachine[]
+
+  @@map("vm_offerings")
+}
+
+model OfferingTemplateMapping {
+  id                   String   @id @default(uuid())
+  operatingSystemId    String   @map("operating_system_id")
+  vmOfferingId         String   @map("vm_offering_id")
+  opennebulaTemplateId Int      @map("opennebula_template_id")
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  operatingSystem OperatingSystem @relation(fields: [operatingSystemId], references: [id], onDelete: Cascade)
+  vmOffering      VmOffering      @relation(fields: [vmOfferingId], references: [id], onDelete: Cascade)
+
+  @@unique([operatingSystemId, vmOfferingId])
+  @@map("offering_template_mappings")
+}
+
+model CustomProvisioningPolicy {
+  id                   String   @id @default(uuid())
+  operatingSystemId    String   @unique @map("operating_system_id")
+  opennebulaTemplateId Int      @map("opennebula_template_id")
+  minVcpu              Int      @default(1) @map("min_vcpu")
+  maxVcpu              Int      @default(2) @map("max_vcpu")
+  stepVcpu             Int      @default(1) @map("step_vcpu")
+  minMemoryMb          Int      @default(256) @map("min_memory_mb")
+  maxMemoryMb          Int      @default(2048) @map("max_memory_mb")
+  stepMemoryMb         Int      @default(256) @map("step_memory_mb")
+  minDiskGb            Int      @default(1) @map("min_disk_gb")
+  maxDiskGb            Int      @default(15) @map("max_disk_gb")
+  stepDiskGb           Int      @default(1) @map("step_disk_gb")
+  active               Boolean  @default(true)
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  operatingSystem OperatingSystem @relation(fields: [operatingSystemId], references: [id], onDelete: Cascade)
+
+  @@map("custom_provisioning_policies")
+}
+
+model ProvisioningOperation {
+  id                   String           @id @default(uuid())
+  userId               String           @map("user_id")
+  idempotencyKey       String           @map("idempotency_key")
+  requestMode          ProvisioningMode @map("request_mode")
+  requestedName        String           @map("requested_name")
+  operatingSystemId    String           @map("operating_system_id")
+  vmOfferingId         String?          @map("vm_offering_id")
+  vcpu                 Int
+  cpuCapacity          Float            @map("cpu_capacity")
+  memoryMb             Int              @map("memory_mb")
+  rootDiskGb           Int              @map("root_disk_gb")
+  sshPublicKey         String           @map("ssh_public_key")
+  opennebulaTemplateId Int              @map("opennebula_template_id")
+  opennebulaVmId       Int?             @map("opennebula_vm_id")
+  status               OperationStatus  @default(PENDING)
+  failureCode          String?          @map("failure_code")
+  failureMessage       String?          @map("failure_message")
+  createdAt            DateTime         @default(now()) @map("created_at")
+  updatedAt            DateTime         @updatedAt @map("updated_at")
+  completedAt          DateTime?        @map("completed_at")
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operatingSystem OperatingSystem @relation(fields: [operatingSystemId], references: [id])
+  vmOffering      VmOffering?     @relation(fields: [vmOfferingId], references: [id])
+
+  @@unique([userId, idempotencyKey])
+  @@index([status, createdAt])
+  @@map("provisioning_operations")
+}
+
+model VirtualMachine {
+  id                String    @id @default(uuid())
+  userId            String    @map("user_id")
+  opennebulaVmId    Int       @unique @map("opennebula_vm_id")
+  name              String
+  operatingSystemId String    @map("operating_system_id")
+  vmOfferingId      String?   @map("vm_offering_id")
+  vcpu              Int
+  memoryMb          Int       @map("memory_mb")
+  rootDiskGb        Int       @map("root_disk_gb")
+  ipAddress         String?   @map("ip_address")
+  lastSyncedAt      DateTime? @map("last_synced_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operatingSystem OperatingSystem @relation(fields: [operatingSystemId], references: [id])
+  vmOffering      VmOffering?     @relation(fields: [vmOfferingId], references: [id])
+
+  @@index([userId, createdAt])
+  @@map("virtual_machines")
+}
+
+model AuditEvent {
+  id          String   @id @default(uuid())
+  actorUserId String?  @map("actor_user_id")
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id")
+  action      String
+  metadata    Json?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@map("audit_events")
+}
