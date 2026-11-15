@@ -30,8 +30,28 @@ enum OperationStatus {
   PENDING
   SUBMITTING
   PROVISIONING
+  IN_PROGRESS
   READY
+  COMPLETED
   FAILED
+}
+
+enum VmRuntimeStatus {
+  ACTIVE
+  UNDEPLOYED
+  POWEROFF
+  SUSPENDED
+  TERMINATED
+  ERROR
+}
+
+enum VmLifecycleAction {
+  START
+  STOP
+  FORCE_STOP
+  REBOOT
+  FORCE_REBOOT
+  TERMINATE
 }
 
 model User {
@@ -44,15 +64,20 @@ model User {
   emailVerifiedAt    DateTime?     @map("email_verified_at")
   opennebulaUserId   Int?          @unique @map("opennebula_user_id")
   opennebulaUsername String?       @unique @map("opennebula_username")
+  quotaMaxVms        Int           @default(2) @map("quota_max_vms")
+  quotaMaxMemoryMb   Int           @default(3072) @map("quota_max_memory_mb")
+  quotaMaxCpu        Float         @default(2.0) @map("quota_max_cpu")
+  quotaMaxDiskGb     Int           @default(20) @map("quota_max_disk_gb")
   rejectionReason    String?       @map("rejection_reason")
   createdAt          DateTime      @default(now()) @map("created_at")
   updatedAt          DateTime      @updatedAt @map("updated_at")
   activatedAt        DateTime?     @map("activated_at")
 
-  verificationCodes  EmailVerificationCode[]
-  operations         ProvisioningOperation[]
-  virtualMachines    VirtualMachine[]
-  auditEvents        AuditEvent[]
+  verificationCodes   EmailVerificationCode[]
+  operations          ProvisioningOperation[]
+  lifecycleOperations VmLifecycleOperation[]
+  virtualMachines     VirtualMachine[]
+  auditEvents         AuditEvent[]
 
   @@map("users")
 }
@@ -169,6 +194,11 @@ model ProvisioningOperation {
   memoryMb             Int              @map("memory_mb")
   rootDiskGb           Int              @map("root_disk_gb")
   sshPublicKey         String           @map("ssh_public_key")
+  portalPublicKey      String?          @map("portal_public_key")
+  encryptedPrivateKey  String?          @map("encrypted_private_key")
+  keyIv                String?          @map("key_iv")
+  keyAuthTag           String?          @map("key_auth_tag")
+  keyFingerprint       String?          @map("key_fingerprint")
   opennebulaTemplateId Int              @map("opennebula_template_id")
   opennebulaVmId       Int?             @map("opennebula_vm_id")
   status               OperationStatus  @default(PENDING)
@@ -188,26 +218,57 @@ model ProvisioningOperation {
 }
 
 model VirtualMachine {
-  id                String    @id @default(uuid())
-  userId            String    @map("user_id")
-  opennebulaVmId    Int       @unique @map("opennebula_vm_id")
-  name              String
-  operatingSystemId String    @map("operating_system_id")
-  vmOfferingId      String?   @map("vm_offering_id")
-  vcpu              Int
-  memoryMb          Int       @map("memory_mb")
-  rootDiskGb        Int       @map("root_disk_gb")
-  ipAddress         String?   @map("ip_address")
-  lastSyncedAt      DateTime? @map("last_synced_at")
-  createdAt         DateTime  @default(now()) @map("created_at")
-  updatedAt         DateTime  @updatedAt @map("updated_at")
+  id                  String          @id @default(uuid())
+  userId              String          @map("user_id")
+  opennebulaVmId      Int             @unique @map("opennebula_vm_id")
+  name                String
+  operatingSystemId   String          @map("operating_system_id")
+  vmOfferingId        String?         @map("vm_offering_id")
+  vcpu                Int
+  cpuCapacity         Float           @default(0.5) @map("cpu_capacity")
+  memoryMb            Int             @map("memory_mb")
+  rootDiskGb          Int             @map("root_disk_gb")
+  ipAddress           String?         @map("ip_address")
+  status              VmRuntimeStatus @default(ACTIVE)
+  lcmState            String?         @map("lcm_state")
+  portalPublicKey     String?         @map("portal_public_key")
+  encryptedPrivateKey String?         @map("encrypted_private_key")
+  keyIv               String?         @map("key_iv")
+  keyAuthTag          String?         @map("key_auth_tag")
+  keyFingerprint      String?         @map("key_fingerprint")
+  terminatedAt        DateTime?       @map("terminated_at")
+  lastSyncedAt        DateTime?       @map("last_synced_at")
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
 
-  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
-  operatingSystem OperatingSystem @relation(fields: [operatingSystemId], references: [id])
-  vmOffering      VmOffering?     @relation(fields: [vmOfferingId], references: [id])
+  user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  operatingSystem     OperatingSystem        @relation(fields: [operatingSystemId], references: [id])
+  vmOffering          VmOffering?            @relation(fields: [vmOfferingId], references: [id])
+  lifecycleOperations VmLifecycleOperation[]
 
-  @@index([userId, createdAt])
+  @@index([userId, status, createdAt])
   @@map("virtual_machines")
+}
+
+model VmLifecycleOperation {
+  id               String            @id @default(uuid())
+  userId           String            @map("user_id")
+  virtualMachineId String            @map("virtual_machine_id")
+  opennebulaVmId   Int               @map("opennebula_vm_id")
+  action           VmLifecycleAction
+  status           OperationStatus   @default(PENDING)
+  failureCode      String?           @map("failure_code")
+  failureMessage   String?           @map("failure_message")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  completedAt      DateTime?         @map("completed_at")
+
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  virtualMachine VirtualMachine @relation(fields: [virtualMachineId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([virtualMachineId, createdAt])
+  @@map("vm_lifecycle_operations")
 }
 
 model AuditEvent {

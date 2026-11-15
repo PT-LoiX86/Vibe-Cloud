@@ -118,10 +118,10 @@ export function AuthScreen() {
           </div>
           <div>
             <h1 className="text-xl font-bold text-slate-900">
-              Welcome to Vibe-Cloud's Private IaaS!
+              Welcome to Vibe-Cloud!
             </h1>
             <p className="text-xs text-slate-500">
-              Your simpler solution to virtual machines for vibe-coders and
+              Your simpler solution to Private IaaS for vibe-coders and
               developers.
             </p>
           </div>

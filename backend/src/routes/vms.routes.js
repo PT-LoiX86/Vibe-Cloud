@@ -4,15 +4,18 @@ import { prisma } from "../config/prisma.js";
 import { requireActiveUser } from "../middleware/auth.middleware.js";
 import { generateEd25519Keypair } from "../services/ssh-keygen.service.js";
 import {
+  encryptPrivateKey,
+  computeSshKeyFingerprint,
+} from "../services/vm-key-vault.service.js";
+import {
   getUserQuotaAndUsage,
   getInfrastructureCapacity,
 } from "../integrations/opennebula/inventory.service.js";
-import { inspectVmState } from "../integrations/opennebula/provisioning.service.js";
 import { recordAudit } from "../services/audit.service.js";
 
 const router = Router();
 
-// One-click Ed25519 key generator (private key is returned once and never stored)
+// One-click Ed25519 key generator for user's local terminal download
 router.post("/vms/generate-ssh-key", requireActiveUser, (req, res) => {
   const vmLabel =
     String(req.body?.vmName || "my-vm")
@@ -23,7 +26,7 @@ router.post("/vms/generate-ssh-key", requireActiveUser, (req, res) => {
       .slice(0, 32) || "my-vm";
 
   const { publicKey, privateKeyPem } = generateEd25519Keypair(
-    `${req.currentUser.username}@iaas-portal`,
+    `${req.currentUser.username}@vibe-cloud`,
   );
 
   return res.json({
@@ -92,7 +95,6 @@ router.post("/vms", requireActiveUser, async (req, res) => {
     sshPublicKey,
   } = parsed.data;
 
-  // Idempotency check
   const existingOp = await prisma.provisioningOperation.findUnique({
     where: {
       userId_idempotencyKey: {
@@ -197,44 +199,88 @@ router.post("/vms", requireActiveUser, async (req, res) => {
     opennebulaTemplateId = policy.opennebulaTemplateId;
   }
 
-  // Preflight quota & physical capacity check
+  // Dual-Layer Quota & Physical Capacity Preflight Check
   try {
-    const [quotaInfo, infra] = await Promise.all([
-      getUserQuotaAndUsage(user.opennebulaUsername),
-      getInfrastructureCapacity(),
-    ]);
+    const [quotaInfo, infra, nonTerminatedVms, inFlightBuilds] =
+      await Promise.all([
+        getUserQuotaAndUsage(user.opennebulaUsername),
+        getInfrastructureCapacity(),
+        prisma.virtualMachine.findMany({
+          where: { userId: user.id, status: { not: "TERMINATED" } },
+          select: { memoryMb: true, cpuCapacity: true, rootDiskGb: true },
+        }),
+        prisma.provisioningOperation.findMany({
+          where: {
+            userId: user.id,
+            status: { in: ["PENDING", "SUBMITTING", "PROVISIONING"] },
+          },
+          select: { memoryMb: true, cpuCapacity: true, rootDiskGb: true },
+        }),
+      ]);
 
     const uq = quotaInfo.userQuotas;
     const reqDiskMb = rootDiskGb * 1024;
 
-    if (uq.vms.limit !== null && uq.vms.used + 1 > uq.vms.limit) {
-      return res.status(400).json({
-        code: "QUOTA_EXCEEDED",
-        error: `VM count quota reached (${uq.vms.used}/${uq.vms.limit} VMs used).`,
-      });
-    }
+    const dbUsedVms = nonTerminatedVms.length + inFlightBuilds.length;
+    const dbUsedMem = [...nonTerminatedVms, ...inFlightBuilds].reduce(
+      (s, v) => s + v.memoryMb,
+      0,
+    );
+    const dbUsedCpu = [...nonTerminatedVms, ...inFlightBuilds].reduce(
+      (s, v) => s + v.cpuCapacity,
+      0,
+    );
+    const dbUsedDiskGb = [...nonTerminatedVms, ...inFlightBuilds].reduce(
+      (s, v) => s + v.rootDiskGb,
+      0,
+    );
+
+    const effectiveUsedVms = Math.max(uq.vms.used, dbUsedVms);
+    const effectiveLimitVms = uq.vms.limit ?? user.quotaMaxVms;
+
+    const effectiveUsedMem = Math.max(uq.memoryMb.used, dbUsedMem);
+    const effectiveLimitMem = uq.memoryMb.limit ?? user.quotaMaxMemoryMb;
+
+    const effectiveUsedCpu = Math.max(uq.cpu.used, dbUsedCpu);
+    const effectiveLimitCpu = uq.cpu.limit ?? user.quotaMaxCpu;
+
+    const effectiveUsedDiskMb = Math.max(uq.diskMb.used, dbUsedDiskGb * 1024);
+    const effectiveLimitDiskMb = uq.diskMb.limit ?? user.quotaMaxDiskGb * 1024;
+
     if (
-      uq.memoryMb.limit !== null &&
-      uq.memoryMb.used + memoryMb > uq.memoryMb.limit
+      effectiveLimitVms !== null &&
+      effectiveUsedVms + 1 > effectiveLimitVms
     ) {
       return res.status(400).json({
         code: "QUOTA_EXCEEDED",
-        error: `Memory quota exceeded (using ${uq.memoryMb.used} MB of ${uq.memoryMb.limit} MB allowance).`,
-      });
-    }
-    if (uq.cpu.limit !== null && uq.cpu.used + cpuCapacity > uq.cpu.limit) {
-      return res.status(400).json({
-        code: "QUOTA_EXCEEDED",
-        error: `CPU quota exceeded (using ${uq.cpu.used} of ${uq.cpu.limit} CPU units).`,
+        error: `VM count quota reached (${effectiveUsedVms}/${effectiveLimitVms} VMs allocated, including stopped VMs).`,
       });
     }
     if (
-      uq.diskMb.limit !== null &&
-      uq.diskMb.used + reqDiskMb > uq.diskMb.limit
+      effectiveLimitMem !== null &&
+      effectiveUsedMem + memoryMb > effectiveLimitMem
     ) {
       return res.status(400).json({
         code: "QUOTA_EXCEEDED",
-        error: `Storage quota exceeded (using ${Math.round(uq.diskMb.used / 1024)} GB of ${Math.round(uq.diskMb.limit / 1024)} GB).`,
+        error: `Memory quota exceeded (${effectiveUsedMem} MB used of ${effectiveLimitMem} MB allowance).`,
+      });
+    }
+    if (
+      effectiveLimitCpu !== null &&
+      effectiveUsedCpu + cpuCapacity > effectiveLimitCpu + 0.001
+    ) {
+      return res.status(400).json({
+        code: "QUOTA_EXCEEDED",
+        error: `CPU quota exceeded (${effectiveUsedCpu.toFixed(1)} used of ${effectiveLimitCpu} CPU units).`,
+      });
+    }
+    if (
+      effectiveLimitDiskMb !== null &&
+      effectiveUsedDiskMb + reqDiskMb > effectiveLimitDiskMb
+    ) {
+      return res.status(400).json({
+        code: "QUOTA_EXCEEDED",
+        error: `Storage quota exceeded (${Math.round(effectiveUsedDiskMb / 1024)} GB used of ${Math.round(effectiveLimitDiskMb / 1024)} GB).`,
       });
     }
 
@@ -254,6 +300,14 @@ router.post("/vms", requireActiveUser, async (req, res) => {
       .json({ error: `Preflight OpenNebula check failed: ${err.message}` });
   }
 
+  // Generate an internal portal-managed Ed25519 keypair and encrypt it with AES-256-GCM
+  // so 1-click browser SSH works even when the user supplies their own public key
+  const managedKeypair = generateEd25519Keypair(
+    `portal-vault-${user.username}@vibe-cloud`,
+  );
+  const encryptedVault = encryptPrivateKey(managedKeypair.privateKeyPem);
+  const keyFingerprint = computeSshKeyFingerprint(managedKeypair.publicKey);
+
   const operation = await prisma.provisioningOperation.create({
     data: {
       userId: user.id,
@@ -267,6 +321,11 @@ router.post("/vms", requireActiveUser, async (req, res) => {
       memoryMb,
       rootDiskGb,
       sshPublicKey,
+      portalPublicKey: managedKeypair.publicKey,
+      encryptedPrivateKey: encryptedVault.encryptedPrivateKey,
+      keyIv: encryptedVault.keyIv,
+      keyAuthTag: encryptedVault.keyAuthTag,
+      keyFingerprint,
       opennebulaTemplateId,
       status: "PENDING",
     },
@@ -287,60 +346,151 @@ router.post("/vms", requireActiveUser, async (req, res) => {
   return res.status(202).json({ operation });
 });
 
-// Phase 1: My VMs shows successfully created/ready VMs only (read-only status & SSH info)
 router.get("/vms", requireActiveUser, async (req, res) => {
   const user = req.currentUser;
+  const includeTerminated = req.query.includeTerminated === "true";
+
   const vms = await prisma.virtualMachine.findMany({
-    where: { userId: user.id },
+    where: {
+      userId: user.id,
+      ...(includeTerminated ? {} : { status: { not: "TERMINATED" } }),
+    },
     orderBy: { createdAt: "desc" },
-    include: {
+    select: {
+      id: true,
+      opennebulaVmId: true,
+      name: true,
+      vcpu: true,
+      cpuCapacity: true,
+      memoryMb: true,
+      rootDiskGb: true,
+      ipAddress: true,
+      status: true,
+      lcmState: true,
+      keyFingerprint: true,
+      terminatedAt: true,
+      lastSyncedAt: true,
+      createdAt: true,
       operatingSystem: true,
       vmOffering: true,
+      lifecycleOperations: {
+        where: { status: { in: ["PENDING", "SUBMITTING", "IN_PROGRESS"] } },
+        orderBy: { createdAt: "desc" },
+        take: 1,
+      },
     },
   });
 
-  // Sync live IP & runtime status from OpenNebula for display
-  const enriched = await Promise.all(
-    vms.map(async (vm) => {
-      try {
-        const live = await inspectVmState(
-          user.opennebulaUsername,
-          vm.opennebulaVmId,
-        );
-        if (live.ipAddress && live.ipAddress !== vm.ipAddress) {
-          await prisma.virtualMachine.update({
-            where: { id: vm.id },
-            data: { ipAddress: live.ipAddress, lastSyncedAt: new Date() },
-          });
-        }
-        return {
-          ...vm,
-          ipAddress: live.ipAddress || vm.ipAddress,
-          runtimeState: live.stateLabel || "ACTIVE",
-          lcmState: live.lcmLabel || "RUNNING",
-        };
-      } catch {
-        return {
-          ...vm,
-          runtimeState: "UNKNOWN",
-          lcmState: "UNREACHABLE",
-        };
-      }
+  const formatted = vms.map(
+    ({ lifecycleOperations, keyFingerprint, ...vm }) => ({
+      ...vm,
+      runtimeState: vm.status,
+      hasManagedKey: Boolean(keyFingerprint),
+      keyFingerprint,
+      activeOperation: lifecycleOperations[0] || null,
     }),
   );
 
-  return res.json({ virtualMachines: enriched });
+  return res.json({ virtualMachines: formatted });
 });
 
-router.get("/vms/:id", requireActiveUser, async (req, res) => {
+const lifecycleActionSchema = z.object({
+  action: z.enum([
+    "START",
+    "STOP",
+    "FORCE_STOP",
+    "REBOOT",
+    "FORCE_REBOOT",
+    "TERMINATE",
+  ]),
+});
+
+router.post("/vms/:id/actions", requireActiveUser, async (req, res) => {
+  const parsed = lifecycleActionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0].message });
+  }
+
+  const user = req.currentUser;
   const vm = await prisma.virtualMachine.findFirst({
-    where: { id: req.params.id, userId: req.currentUser.id },
-    include: { operatingSystem: true, vmOffering: true },
+    where: { id: req.params.id, userId: user.id },
   });
+
   if (!vm) {
     return res.status(404).json({ error: "Virtual machine not found." });
   }
-  return res.json({ virtualMachine: vm });
+
+  if (vm.status === "TERMINATED") {
+    return res
+      .status(400)
+      .json({ error: "Terminated virtual machines cannot be modified." });
+  }
+
+  const existingOp = await prisma.vmLifecycleOperation.findFirst({
+    where: {
+      virtualMachineId: vm.id,
+      status: { in: ["PENDING", "SUBMITTING", "IN_PROGRESS"] },
+    },
+  });
+
+  if (existingOp) {
+    return res.status(409).json({
+      error: `Another lifecycle operation (${existingOp.action}) is already in progress for this VM.`,
+    });
+  }
+
+  const { action } = parsed.data;
+  const stoppedStates = new Set(["UNDEPLOYED", "POWEROFF", "SUSPENDED"]);
+
+  if (action === "START" && !stoppedStates.has(vm.status)) {
+    return res
+      .status(400)
+      .json({ error: `Cannot start a VM that is currently ${vm.status}.` });
+  }
+
+  if (
+    ["STOP", "FORCE_STOP", "REBOOT", "FORCE_REBOOT"].includes(action) &&
+    vm.status !== "ACTIVE"
+  ) {
+    return res.status(400).json({
+      error: `Cannot perform ${action} while VM is ${vm.status}.`,
+    });
+  }
+
+  const operation = await prisma.vmLifecycleOperation.create({
+    data: {
+      userId: user.id,
+      virtualMachineId: vm.id,
+      opennebulaVmId: vm.opennebulaVmId,
+      action,
+      status: "PENDING",
+    },
+  });
+
+  await recordAudit({
+    actorUserId: user.id,
+    targetType: "VirtualMachine",
+    targetId: String(vm.opennebulaVmId),
+    action: `VM_${action}_REQUESTED`,
+    metadata: { operationId: operation.id, vmName: vm.name },
+  });
+
+  return res.status(202).json({ operation });
+});
+
+router.get("/lifecycle-operations", requireActiveUser, async (req, res) => {
+  const operations = await prisma.vmLifecycleOperation.findMany({
+    where: { userId: req.currentUser.id },
+    orderBy: { createdAt: "desc" },
+    take: 40,
+    include: {
+      virtualMachine: {
+        select: { name: true, opennebulaVmId: true },
+      },
+    },
+  });
+
+  return res.json({ operations });
 });
 
 router.get("/provisioning-operations", requireActiveUser, async (req, res) => {

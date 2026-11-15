@@ -40,7 +40,6 @@ export async function provisionOpenNebulaUser(
     suffix += 1;
   }
 
-  // Separate random password for OpenNebula core account
   const randomOnePassword = crypto.randomBytes(24).toString("hex");
   const userId = await callOne(
     "one.user.allocate",
@@ -54,14 +53,20 @@ export async function provisionOpenNebulaUser(
   };
 }
 
-export async function applyDefaultUserQuota(opennebulaUserId) {
+export async function applyUserQuota(
+  opennebulaUserId,
+  { maxVms = 2, maxMemoryMb = 3072, maxCpu = 2.0, maxDiskGb = 20 } = {},
+) {
   const adminActor = env.oneServerUser;
-  // Per-user quota tailored for group 'users' which has 4 VMs / 6144 MB total
-  const quotaTemplate =
-    "VM = [ VMS = 2, MEMORY = 3072, CPU = 2.0, DISK_SIZE = 20480 ]";
+  const diskMb = Math.round(Number(maxDiskGb) * 1024);
+  const quotaTemplate = `VM = [ VMS = ${Number(maxVms)}, MEMORY = ${Number(maxMemoryMb)}, CPU = ${Number(maxCpu).toFixed(2)}, DISK_SIZE = ${diskMb} ]`;
   await callOne(
     "one.user.quota",
     [Number(opennebulaUserId), quotaTemplate],
     adminActor,
   );
+}
+
+export async function applyDefaultUserQuota(opennebulaUserId) {
+  return applyUserQuota(opennebulaUserId);
 }
